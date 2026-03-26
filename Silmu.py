@@ -9,8 +9,6 @@ from google import genai
 st.set_page_config(page_title="금융 데이터 감사 통합 툴킷", layout="wide")
 
 # --- 2. AI 설정 (보안 강화: st.secrets 활용) ---
-# 로컬 테스트 시에는 .streamlit/secrets.toml 파일을 만들어 사용하고,
-# 배포 시에는 Streamlit Cloud 설정 창(Secrets)에 키를 입력해야 합니다.
 try:
     GENAI_API_KEY = st.secrets["GENAI_API_KEY"]
 except KeyError:
@@ -29,8 +27,6 @@ menu = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 st.sidebar.info("💡 **Tip**: 2번 AI 검사 시 '행 수'를 조절하여 속도를 관리하세요.")
-
-# --- 기능별 상세 구현 ---
 
 # [메인 화면]
 if menu == "메인 화면":
@@ -80,7 +76,7 @@ elif menu == "1) 수식 추출":
             except Exception as e:
                 st.error(f"❌ 오류 발생: {e}")
 
-# [기능 2: 오타 검정]
+# [기능 2: 오타 검정 - 성능 복구 버전]
 elif menu == "2) 오타 검정 (AI 검사)":
     st.header("🤖 AI 기반 텍스트 오타 정밀 검수")
     st.write("선택한 컬럼에서 오타, 깨진 글자, 띄어쓰기 오류를 집중적으로 찾아냅니다.")
@@ -97,55 +93,91 @@ elif menu == "2) 오타 검정 (AI 검사)":
             if not target_cols:
                 st.error("⚠️ 검사할 컬럼을 하나 이상 선택해 주세요.")
             else:
-                errors_all = []
+                all_errors = []
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
                 for idx in range(num_rows):
-                    status_text.text(f"⏳ 전체 {num_rows}행 중 {idx+1}번째 행 분석 중...")
+                    status_text.text(f"⏳ 전체 {num_rows}행 중 {idx+1}번째 행 기계적 검수 중...")
+                    
                     row = df.iloc[idx]
+                    # 선택된 컬럼의 데이터만 추출
                     row_data = {col: row[col] for col in target_cols}
                     row_json = json.dumps(row_data, ensure_ascii=False)
                     
+                    # 💡 성능이 검증된 '네거티브 전략' 프롬프트
                     prompt = f"""
                     당신은 텍스트에서 '깨진 글자'와 '명백한 맞춤법 오류'만 찾아내는 기계입니다.
+                    
                     [데이터]
                     {row_json}
-                    [검수 규칙]
+
+                    [검수 규칙 - 이 조건이 아니면 절대로 보고하지 마세요]
                     1. 자모음 분리: 글자 끝에 자음/모음이 남은 경우
                     2. 명백한 오타: 받침이 틀렸거나 자음이 잘못 들어간 경우
                     3. 띄어쓰기 오류: 단어 중간에 공백이 들어간 경우
-                    [절대 금지]
-                    - 정상적인 단어 무시, 원문과 추천이 같으면 무시, 문맥 개선 금지.
+
+                    [절대 금지 - 위반 시 업무 실패]
+                    - 정상적인 한글 단어를 오타라고 보고하지 마세요.
+                    - 원문(Original)과 추천(Suggestion)이 똑같은 경우는 절대로 보고하지 마십시오.
+                    - 문맥을 '개선'하려고 하지 마십시오. 틀린 '글자'만 찾으십시오.
+
+                    [응답 형식]
+                    - 오류가 있을 때만 JSON 출력. 없으면 반드시 {{"errors": []}}
+                    
+                    {{
+                        "errors": [
+                            {{
+                                "column": "컬럼명", 
+                                "original": "틀린 글자", 
+                                "suggestion": "바른 글자", 
+                                "reason": "오타/자모음분리/띄어쓰기 중 택1"
+                            }}
+                        ]
+                    }}
                     """
 
                     try:
                         response = client.models.generate_content(
                             model=MODEL_ID,
                             contents=prompt,
-                            config={'response_mime_type': 'application/json', 'temperature': 0.0}
+                            config={
+                                'response_mime_type': 'application/json',
+                                'temperature': 0.0 # 창의성 0으로 고정
+                            }
                         )
                         errs = json.loads(response.text).get("errors", [])
+                        
                         for e in errs:
                             orig = str(e.get('original', '')).strip()
                             sugg = str(e.get('suggestion', '')).strip()
+                            
+                            # 핵심 필터: 원문과 추천이 다르고 비어있지 않은 경우만 수집
                             if orig and sugg and orig != sugg:
-                                e['row_index'] = idx + 2
-                                errors_all.append(e)
+                                e['row_index'] = idx + 2 # 엑셀 실제 행 번호
+                                all_errors.append(e)
                     except:
                         continue
+                    
                     progress_bar.progress((idx + 1) / num_rows)
                 
                 status_text.empty()
-                if errors_all:
-                    report_df = pd.DataFrame(errors_all)
-                    st.success(f"✅ 검수 완료! {len(errors_all)}개의 확실한 오타를 발견했습니다.")
-                    st.dataframe(report_df[['row_index', 'column', 'original', 'suggestion', 'reason']], use_container_width=True)
+                
+                if all_errors:
+                    report_df = pd.DataFrame(all_errors)
+                    st.success(f"✅ 검수 완료! {len(all_errors)}개의 확실한 오타를 발견했습니다.")
+                    
+                    # 리포트 컬럼 순서 정리
+                    cols = ['row_index', 'column', 'original', 'suggestion', 'reason']
+                    display_df = report_df[[c for c in cols if c in report_df.columns]]
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                    # 엑셀 다운로드 버튼
                     output = io.BytesIO()
-                    report_df.to_excel(output, index=False)
+                    display_df.to_excel(output, index=False)
                     st.download_button("오타 리포트 다운로드", output.getvalue(), "typo_report_fixed.xlsx")
                 else:
-                    st.success("🎉 발견된 오타가 없습니다.")
+                    st.success("🎉 발견된 오타가 없습니다. 데이터가 아주 깨끗합니다.")
 
 # [기능 3: 병합 해제]
 elif menu == "3) 병합 해제 (데이터 클렌징)":
